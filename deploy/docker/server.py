@@ -27,7 +27,7 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from api import (
     handle_markdown_request, handle_llm_qa,
     handle_stream_crawl_request, handle_crawl_request,
-    stream_results
+    stream_results, _build_safe_deep_crawl_strategy
 )
 from schemas import (
     CrawlRequestWithHooks,
@@ -959,16 +959,31 @@ async def crawl(
         raise HTTPException(400, "At least one URL required")
     if crawl_request.hooks and not HOOKS_ENABLED:
         raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
+
+    # deep_crawl_strategy is forbidden on untrusted request bodies (R2). Only
+    # the operator's static CRAWL4AI_API_TOKEN (admin scope) may request it,
+    # and only through the narrow allowlisted builder in api.py - never the
+    # raw dict straight into the strategy constructor.
+    crawler_config_dict = crawl_request.crawler_config
+    deep_crawl_override = None
+    if isinstance(crawler_config_dict, dict) and isinstance(crawler_config_dict.get("deep_crawl_strategy"), dict):
+        principal = getattr(request.state, "principal", None)
+        if principal and principal.get("scope") == "admin":
+            crawler_config_dict = dict(crawler_config_dict)
+            deep_crawl_override = _build_safe_deep_crawl_strategy(crawler_config_dict.pop("deep_crawl_strategy"))
+
     # Check whether it is a redirection for a streaming request
     try:
         crawler_config = CrawlerRunConfig.load(
-            crawl_request.crawler_config, provenance=Provenance.UNTRUSTED
+            crawler_config_dict, provenance=Provenance.UNTRUSTED
         )
     except UntrustedConfigError as e:
         raise HTTPException(400, f"Rejected config: {e}")
+    if deep_crawl_override is not None:
+        crawler_config.deep_crawl_strategy = deep_crawl_override
     if crawler_config.stream:
         return await stream_process(crawl_request=crawl_request)
-    
+
     # Prepare hooks config if provided
     hooks_config = None
     if crawl_request.hooks:
@@ -976,14 +991,15 @@ async def crawl(
             'hooks': crawl_request.hooks.hooks,
             'timeout': crawl_request.hooks.timeout
         }
-    
+
     results = await handle_crawl_request(
         urls=crawl_request.urls,
         browser_config=crawl_request.browser_config,
-        crawler_config=crawl_request.crawler_config,
+        crawler_config=crawler_config_dict,
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
+        deep_crawl_strategy_override=deep_crawl_override,
     )
     # check if all of the results are not successful
     if all(not result["success"] for result in results["results"]):

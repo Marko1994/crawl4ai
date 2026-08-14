@@ -31,6 +31,53 @@ from llm_broker import LLMProviderNotAllowed
 from crawl4ai.utils import perform_completion_with_backoff
 
 
+# deep_crawl_strategy is forbidden on any untrusted (network) CrawlerRunConfig
+# body (see crawl4ai/async_configs.py UNTRUSTED_FORBIDDEN_FIELDS) because its
+# constructor accepts arbitrary nested objects (url_scorer, filter_chain,
+# etc.) that would let a request body inject unvalidated code paths. Callers
+# authenticated with the operator's static CRAWL4AI_API_TOKEN (admin scope -
+# see auth_gate.py) may request deep crawling through this narrow, explicit
+# allowlist instead: only scalar fields, only known strategy classes, no
+# nested/callable objects. governor.clamp_deep_crawl() still runs afterward
+# as defense in depth regardless of who requested it.
+_DEEP_CRAWL_ALLOWED_FIELDS = {"max_pages", "max_depth", "include_external"}
+
+
+def _build_safe_deep_crawl_strategy(raw: dict):
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "deep_crawl_strategy must be an object")
+    from crawl4ai.deep_crawling import (
+        BFSDeepCrawlStrategy, DFSDeepCrawlStrategy, BestFirstCrawlingStrategy,
+    )
+    strategy_classes = {
+        "BFSDeepCrawlStrategy": BFSDeepCrawlStrategy,
+        "DFSDeepCrawlStrategy": DFSDeepCrawlStrategy,
+        "BestFirstCrawlingStrategy": BestFirstCrawlingStrategy,
+    }
+    strat_name = raw.get("name") or raw.get("type") or "BFSDeepCrawlStrategy"
+    cls = strategy_classes.get(strat_name)
+    if cls is None:
+        raise HTTPException(
+            400,
+            f"Unknown deep_crawl_strategy name '{strat_name}'. "
+            f"Allowed: {sorted(strategy_classes)}",
+        )
+    unknown = set(raw) - _DEEP_CRAWL_ALLOWED_FIELDS - {"name", "type"}
+    if unknown:
+        raise HTTPException(
+            400,
+            f"deep_crawl_strategy fields not permitted: {sorted(unknown)}. "
+            f"Allowed: {sorted(_DEEP_CRAWL_ALLOWED_FIELDS)}",
+        )
+    kwargs = {k: v for k, v in raw.items() if k in _DEEP_CRAWL_ALLOWED_FIELDS}
+    for int_field in ("max_pages", "max_depth"):
+        if int_field in kwargs and not isinstance(kwargs[int_field], int):
+            raise HTTPException(400, f"deep_crawl_strategy.{int_field} must be an integer")
+    if "include_external" in kwargs and not isinstance(kwargs["include_external"], bool):
+        raise HTTPException(400, "deep_crawl_strategy.include_external must be a boolean")
+    return cls(**kwargs)
+
+
 def _enqueue_job(background_tasks, factory, principal=None):
     """Submit a background job to the bounded work queue (per-principal quota).
 
@@ -651,6 +698,7 @@ async def handle_crawl_request(
     config: dict,
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
+    deep_crawl_strategy_override=None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
     # Track request start
@@ -673,6 +721,8 @@ async def handle_crawl_request(
         urls = _normalize_and_validate_seeds(urls)
         browser_config = BrowserConfig.load(browser_config, provenance=Provenance.UNTRUSTED)
         crawler_config = CrawlerRunConfig.load(crawler_config, provenance=Provenance.UNTRUSTED)
+        if deep_crawl_strategy_override is not None:
+            crawler_config.deep_crawl_strategy = deep_crawl_strategy_override
         from egress_broker import enforce_egress
         enforce_egress(browser_config)
         from governor import clamp_deep_crawl
