@@ -629,6 +629,85 @@ async def generate_html(
         if crawler:
             await release_crawler(crawler)
 
+
+class MultiDeviceHTMLRequest(BaseModel):
+    url: str
+    devices: Optional[List[str]] = Field(default_factory=lambda: ["desktop", "mobile", "tablet"])
+
+
+@app.post("/multi-device-html")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def generate_multi_device_html(
+    request: Request,
+    body: MultiDeviceHTMLRequest,
+    _td: Dict = Depends(token_dep),
+):
+    """
+    Crawls the URL across multiple requested device viewports (desktop, mobile, tablet)
+    and returns all rendered raw HTML representations in a single response!
+    """
+    validate_url_scheme(body.url, allow_raw=True)
+    device_map = {
+        "desktop": {
+            "width": 1920,
+            "height": 1080,
+            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+        },
+        "mobile": {
+            "width": 390,
+            "height": 844,
+            "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        },
+        "tablet": {
+            "width": 768,
+            "height": 1024,
+            "ua": "Mozilla/5.0 (iPad; CPU OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        }
+    }
+
+    # Only known device keys are accepted (deduped, order-preserved) so the
+    # requested list can't be used to force an unbounded number of crawls.
+    requested = body.devices if body.devices else ["desktop", "mobile", "tablet"]
+    selected_devices = []
+    for dev in requested:
+        dev_key = str(dev).lower()
+        if dev_key in device_map and dev_key not in selected_devices:
+            selected_devices.append(dev_key)
+    if not selected_devices:
+        raise HTTPException(400, detail=f"No valid devices requested. Valid options: {list(device_map.keys())}")
+
+    async def crawl_device(dev_key: str) -> tuple:
+        cfg_opts = device_map[dev_key]
+        b_cfg = BrowserConfig(
+            headless=True,
+            viewport_width=cfg_opts["width"],
+            viewport_height=cfg_opts["height"],
+            user_agent=cfg_opts["ua"]
+        )
+        from egress_broker import enforce_egress
+        enforce_egress(b_cfg)
+        crawler = None
+        try:
+            crawler = await get_crawler(b_cfg)
+            res = await crawler.arun(url=body.url, config=CrawlerRunConfig())
+            if res and res[0].success:
+                return dev_key, {"success": True, "html": res[0].html}
+            return dev_key, {"success": False, "error": res[0].error_message if res else "Crawl failed"}
+        except Exception as ex:
+            return dev_key, {"success": False, "error": str(ex)}
+        finally:
+            if crawler:
+                await release_crawler(crawler)
+
+    results = await asyncio.gather(*(crawl_device(dev_key) for dev_key in selected_devices))
+    results_by_device = dict(results)
+
+    return JSONResponse({
+        "url": body.url,
+        "success": any(r["success"] for r in results_by_device.values()),
+        "html": results_by_device
+    })
+
 # ── artifact store helpers ───────────────────────────────────
 def _store_artifact(kind: str, data: bytes) -> dict:
     """Write to the sandboxed store; map quota/size errors to HTTP codes."""
