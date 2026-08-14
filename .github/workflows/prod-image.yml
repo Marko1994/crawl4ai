@@ -1,0 +1,61 @@
+name: Build and Push Prod Image
+
+# Builds this fork's prod-deploy branch and publishes it to GHCR, so the
+# production VPS only ever does `docker compose pull` + `up` - never builds
+# from source on the server itself.
+on:
+  push:
+    branches: [prod-deploy]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/crawl4ai
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo apt-get clean
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.sha.outputs.short }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "## Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ env.IMAGE }}:latest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ env.IMAGE }}:${{ steps.sha.outputs.short }}\`" >> "$GITHUB_STEP_SUMMARY"

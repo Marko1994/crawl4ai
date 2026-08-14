@@ -59,11 +59,15 @@ x-base-config: &base-config
 
 services:
   crawl4ai:
-    # 1. Default: Pull multi-platform test image from Docker Hub
-    # 2. Override with local image via: IMAGE=local-test docker compose up
-    image: ${IMAGE:-unclecode/crawl4ai:${TAG:-latest}}
-    
-    # Local build config (used with --build)
+    # 1. Default: pull our own prod image, built by
+    #    .github/workflows/prod-image.yml from the prod-deploy branch and
+    #    published to GHCR - `docker compose pull` is enough on prod, no
+    #    local build required.
+    # 2. Override with a different image/tag via: IMAGE=... TAG=... docker compose up
+    image: ${IMAGE:-ghcr.io/marko1994/crawl4ai:${TAG:-latest}}
+
+    # Local build config, used only when explicitly building
+    # (`docker compose build` / `up --build`) - e.g. on a dev machine.
     build:
       context: .
       dockerfile: Dockerfile
