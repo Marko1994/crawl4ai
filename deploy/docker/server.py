@@ -27,7 +27,7 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from api import (
     handle_markdown_request, handle_llm_qa,
     handle_stream_crawl_request, handle_crawl_request,
-    stream_results, _build_safe_deep_crawl_strategy
+    stream_results, _build_safe_deep_crawl_strategy, _build_safe_extraction_strategy
 )
 from schemas import (
     CrawlRequestWithHooks,
@@ -960,17 +960,24 @@ async def crawl(
     if crawl_request.hooks and not HOOKS_ENABLED:
         raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
 
-    # deep_crawl_strategy is forbidden on untrusted request bodies (R2). Only
-    # the operator's static CRAWL4AI_API_TOKEN (admin scope) may request it,
-    # and only through the narrow allowlisted builder in api.py - never the
-    # raw dict straight into the strategy constructor.
+    # deep_crawl_strategy and extraction_strategy (LLM) both require admin
+    # scope (the operator's static CRAWL4AI_API_TOKEN) and go through the
+    # narrow allowlisted builders in api.py - never the raw dict straight
+    # into the strategy/LLM constructor. See api.py for why.
     crawler_config_dict = crawl_request.crawler_config
     deep_crawl_override = None
-    if isinstance(crawler_config_dict, dict) and isinstance(crawler_config_dict.get("deep_crawl_strategy"), dict):
+    extraction_override = None
+    if isinstance(crawler_config_dict, dict) and (
+        isinstance(crawler_config_dict.get("deep_crawl_strategy"), dict)
+        or isinstance(crawler_config_dict.get("extraction_strategy"), dict)
+    ):
         principal = getattr(request.state, "principal", None)
         if principal and principal.get("scope") == "admin":
             crawler_config_dict = dict(crawler_config_dict)
-            deep_crawl_override = _build_safe_deep_crawl_strategy(crawler_config_dict.pop("deep_crawl_strategy"))
+            if isinstance(crawler_config_dict.get("deep_crawl_strategy"), dict):
+                deep_crawl_override = _build_safe_deep_crawl_strategy(crawler_config_dict.pop("deep_crawl_strategy"))
+            if isinstance(crawler_config_dict.get("extraction_strategy"), dict):
+                extraction_override = _build_safe_extraction_strategy(crawler_config_dict.pop("extraction_strategy"), config)
 
     # Check whether it is a redirection for a streaming request
     try:
@@ -981,6 +988,8 @@ async def crawl(
         raise HTTPException(400, f"Rejected config: {e}")
     if deep_crawl_override is not None:
         crawler_config.deep_crawl_strategy = deep_crawl_override
+    if extraction_override is not None:
+        crawler_config.extraction_strategy = extraction_override
     if crawler_config.stream:
         return await stream_process(crawl_request=crawl_request)
 
@@ -1000,6 +1009,7 @@ async def crawl(
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
         deep_crawl_strategy_override=deep_crawl_override,
+        extraction_strategy_override=extraction_override,
     )
     # check if all of the results are not successful
     if all(not result["success"] for result in results["results"]):

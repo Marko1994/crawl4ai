@@ -78,6 +78,51 @@ def _build_safe_deep_crawl_strategy(raw: dict):
     return cls(**kwargs)
 
 
+# Same admin-scope gating as deep_crawl_strategy, for the same reason: an
+# untrusted request may not construct LLMExtractionStrategy/LLMConfig objects
+# directly. provider/api_token/base_url are ALWAYS resolved server-side via
+# llm_broker.resolve_llm() - never taken from the request - which is what
+# closes the credential-exfil gadget described in llm_broker.py's docstring
+# (a request-supplied base_url could redirect the server's own provider key
+# to an attacker-controlled host).
+_EXTRACTION_ALLOWED_FIELDS = {"provider", "instruction", "schema"}
+
+
+def _build_safe_extraction_strategy(raw: dict, config: dict):
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "extraction_strategy must be an object")
+    strat_name = raw.get("name") or raw.get("type") or "LLMExtractionStrategy"
+    if strat_name != "LLMExtractionStrategy":
+        raise HTTPException(
+            400, f"Unknown extraction_strategy name '{strat_name}'. Allowed: ['LLMExtractionStrategy']"
+        )
+    unknown = set(raw) - _EXTRACTION_ALLOWED_FIELDS - {"name", "type"}
+    if unknown:
+        raise HTTPException(
+            400,
+            f"extraction_strategy fields not permitted: {sorted(unknown)}. "
+            f"Allowed: {sorted(_EXTRACTION_ALLOWED_FIELDS)}",
+        )
+    instruction = raw.get("instruction")
+    if instruction is not None and not isinstance(instruction, str):
+        raise HTTPException(400, "extraction_strategy.instruction must be a string")
+    schema = raw.get("schema")
+    if schema is not None and not isinstance(schema, dict):
+        raise HTTPException(400, "extraction_strategy.schema must be an object")
+    requested_provider = raw.get("provider")
+    if requested_provider is not None and not isinstance(requested_provider, str):
+        raise HTTPException(400, "extraction_strategy.provider must be a string")
+
+    from llm_broker import resolve_llm
+    try:
+        llm = resolve_llm(config, requested_provider)
+    except LLMProviderNotAllowed as e:
+        raise HTTPException(400, str(e))
+
+    llm_config = LLMConfig(provider=llm["provider"], api_token=llm["api_token"], base_url=llm["base_url"])
+    return LLMExtractionStrategy(llm_config=llm_config, instruction=instruction or "", schema=schema)
+
+
 def _enqueue_job(background_tasks, factory, principal=None):
     """Submit a background job to the bounded work queue (per-principal quota).
 
@@ -699,6 +744,7 @@ async def handle_crawl_request(
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
     deep_crawl_strategy_override=None,
+    extraction_strategy_override=None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
     # Track request start
@@ -723,6 +769,8 @@ async def handle_crawl_request(
         crawler_config = CrawlerRunConfig.load(crawler_config, provenance=Provenance.UNTRUSTED)
         if deep_crawl_strategy_override is not None:
             crawler_config.deep_crawl_strategy = deep_crawl_strategy_override
+        if extraction_strategy_override is not None:
+            crawler_config.extraction_strategy = extraction_strategy_override
         from egress_broker import enforce_egress
         enforce_egress(browser_config)
         from governor import clamp_deep_crawl

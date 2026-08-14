@@ -13,7 +13,19 @@ app:
 
 # Default LLM Configuration
 llm:
-  provider: "openai/gpt-4o-mini"
+  # Matches the GEMINI_API_KEY actually set in .llm.env. llm_broker.py
+  # matches by FAMILY (the part before "/"), not exact model string, so
+  # any entry here effectively allows every "gemini/*" model - only add a
+  # family once its API key is actually present in .llm.env, or requests
+  # for it get rejected with "LLM provider not allowed".
+  # gemini-2.0-flash / gemini-2.5-flash / gemini-1.5-flash are all
+  # deprecated/retired by Google as of this writing; gemini-flash-latest is
+  # the confirmed-working alias (tested live against the real Gemini API).
+  provider: "gemini/gemini-flash-latest"
+  allowed_providers:
+    - "gemini/gemini-flash-latest"
+    - "gemini/gemma-4-26b-a4b-it"
+    # - "openai/gpt-4o"  # uncomment once OPENAI_API_KEY is set in .llm.env
   # api_key: sk-...  # If you pass the API key directly (not recommended)
 
 # Redis Configuration
