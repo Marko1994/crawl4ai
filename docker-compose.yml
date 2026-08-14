@@ -2,8 +2,9 @@ version: '3.8'
 
 # Shared configuration for all environments
 x-base-config: &base-config
-  ports:
-    - "11235:11235"  # Gunicorn port
+  # No host port publish: crawl4ai is reached over the kb-crawl network by
+  # kb-worker (http://crawl4ai:11235), never from outside the host. Add back
+  # `ports: ["127.0.0.1:11235:11235"]` here temporarily for local curl/debug.
   env_file:
     - .llm.env       # API keys (create from .llm.env.example)
   # Uncomment to set default environment variables (will overwrite .llm.env)
@@ -39,6 +40,12 @@ x-base-config: &base-config
     resources:
       limits:
         memory: 4G
+        # Must mirror pids_limit above - this compose CLI version (v2.29+)
+        # rejects the config if the two disagree ("distinct values on
+        # 'pids_limit' and 'deploy.resources.limits.pids'"). Pre-existing
+        # upstream issue, reproduces on unmodified main; not caused by our
+        # changes.
+        pids: 512
       reservations:
         memory: 1G
   restart: unless-stopped
@@ -66,3 +73,15 @@ services:
     
     # Inherit shared config
     <<: *base-config
+
+    # Reachable from the kb project's containers as http://crawl4ai:11235.
+    # `default` keeps this project's own compose network; `kb-crawl` is the
+    # externally-created network shared with the kb-worker stack. The service
+    # DNS alias only registers on networks declared here in compose - a
+    # post-hoc `docker network connect` will NOT get the `crawl4ai` alias.
+    networks: [default, kb-crawl]
+
+networks:
+  default: {}
+  kb-crawl:
+    external: true
