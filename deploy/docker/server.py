@@ -984,7 +984,14 @@ async def crawl(
         crawler_config = CrawlerRunConfig.load(
             crawler_config_dict, provenance=Provenance.UNTRUSTED
         )
-    except UntrustedConfigError as e:
+    # UntrustedConfigError is itself a ValueError; catching the base class also
+    # covers CrawlerRunConfig's own validation (e.g. a non-admin sending an
+    # extraction_strategy dict, which is allowlisted as a *field* but rejected
+    # by the constructor's isinstance check). Those are malformed-request
+    # errors, and a 500 would invite clients to retry a request that can never
+    # succeed. The try wraps only config construction, so genuine crawl-time
+    # failures are unaffected.
+    except ValueError as e:
         raise HTTPException(400, f"Rejected config: {e}")
     if deep_crawl_override is not None:
         crawler_config.deep_crawl_strategy = deep_crawl_override

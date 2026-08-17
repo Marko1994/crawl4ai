@@ -1,7 +1,41 @@
 from typing import Any, List, Optional, Dict
 from enum import Enum
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 from utils import FilterType
+
+
+# ───────────────────── flat /crawl request fields (sugar) ─────────────────────
+# API_DOCUMENTATION.md documents a flat request body for frontend callers:
+#
+#     {"urls": [...], "max_pages": 15, "provider": "gemini/...", "ignore_links": false}
+#
+# None of these are CrawlerRunConfig fields - they belong to nested strategy
+# objects (deep_crawl_strategy / extraction_strategy / markdown_generator).
+# Because this model does not set extra="forbid", pydantic's default
+# extra="ignore" used to drop them silently: the request succeeded, and not one
+# of the options took effect. CrawlRequest therefore desugars the flat form into
+# the nested form up front.
+#
+# This is sugar only. Desugaring runs at model-validation time, i.e. *before*
+# the admin-scope check in server.py, so a flat deep_crawl/extraction request
+# still goes through the same allowlisted builders in api.py and is still
+# refused for non-admin callers. It is not a way around that gate.
+_FLAT_DEEP_CRAWL_FIELDS = ("max_pages", "max_depth", "include_external")
+_FLAT_EXTRACTION_FIELDS = ("provider", "instruction", "schema")
+_FLAT_MARKDOWN_FIELDS = ("ignore_links", "ignore_images")
+
+# Validated here rather than downstream so a typo is a 422 at the edge instead
+# of a confusing failure inside a strategy constructor.
+_FLAT_FIELD_TYPES = {
+    "max_pages": int,
+    "max_depth": int,
+    "include_external": bool,
+    "ignore_links": bool,
+    "ignore_images": bool,
+    "provider": str,
+    "instruction": str,
+    "schema": dict,
+}
 
 
 class CrawlRequest(BaseModel):
@@ -16,6 +50,113 @@ class CrawlRequest(BaseModel):
             "to match against specific URLs. Takes precedence over crawler_config."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _desugar_flat_fields(cls, data):
+        """Fold the documented flat fields into nested crawler_config strategies.
+
+        An explicitly supplied nested strategy always wins - the flat form never
+        overwrites what the caller spelled out, so clients already sending the
+        nested shape are unaffected.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        # An explicit null means "not set", same as omitting the key.
+        present = {
+            key: data[key]
+            for key in _FLAT_FIELD_TYPES
+            if key in data and data[key] is not None
+        }
+        if not present:
+            return data
+
+        for key, value in present.items():
+            expected = _FLAT_FIELD_TYPES[key]
+            # bool is a subclass of int in Python; True is not a page budget.
+            if expected is int:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(f"{key} must be an integer")
+                # governor.clamp_deep_crawl only clamps *upward*, so a negative
+                # or zero budget would otherwise reach the strategy unchecked.
+                if value < 1:
+                    raise ValueError(f"{key} must be at least 1")
+            elif not isinstance(value, expected):
+                article = "an object" if expected is dict else f"a {expected.__name__}"
+                raise ValueError(f"{key} must be {article}")
+
+        # crawler_configs (plural) takes precedence over crawler_config
+        # downstream, which would silently discard everything desugared here -
+        # the exact failure mode this sugar exists to remove. Refuse instead.
+        if data.get("crawler_configs"):
+            raise ValueError(
+                "flat fields ("
+                + ", ".join(sorted(present))
+                + ") cannot be combined with crawler_configs; "
+                "put the equivalent nested config in each crawler_configs entry"
+            )
+
+        raw_crawler_config = data.get("crawler_config")
+        if raw_crawler_config is not None and not isinstance(raw_crawler_config, dict):
+            # dict([1, 2]) raises TypeError, which pydantic does not turn into a
+            # validation error - it would surface as a 500 rather than a 422.
+            raise ValueError("crawler_config must be an object")
+
+        data = dict(data)
+        crawler_config = dict(raw_crawler_config or {})
+
+        def _explicit(strategy_key: str) -> bool:
+            """True when the caller actually supplied a nested strategy.
+
+            A null value counts as absent, matching the treatment of flat nulls.
+            Leaving the null in place would both suppress the sugar and trip the
+            untrusted forbidden-field check.
+            """
+            if crawler_config.get(strategy_key) is not None:
+                return True
+            crawler_config.pop(strategy_key, None)
+            return False
+
+        # include_external alone is not a request for a deep crawl - it only
+        # qualifies one. Synthesising a strategy for it would silently turn a
+        # single-page crawl into a whole-site crawl.
+        wants_deep_crawl = "max_pages" in present or "max_depth" in present
+        if wants_deep_crawl and not _explicit("deep_crawl_strategy"):
+            strategy = {
+                "name": "BFSDeepCrawlStrategy",
+                **{k: present[k] for k in _FLAT_DEEP_CRAWL_FIELDS if k in present},
+            }
+            # max_depth is a *required* positional arg of every deep-crawl
+            # strategy, so `max_pages` on its own would raise TypeError inside
+            # the builder. Depth 1 = the given page plus its direct links.
+            strategy.setdefault("max_depth", 1)
+            crawler_config["deep_crawl_strategy"] = strategy
+
+        if any(k in present for k in _FLAT_EXTRACTION_FIELDS) and not _explicit(
+            "extraction_strategy"
+        ):
+            crawler_config["extraction_strategy"] = {
+                "name": "LLMExtractionStrategy",
+                **{k: present[k] for k in _FLAT_EXTRACTION_FIELDS if k in present},
+            }
+
+        if any(k in present for k in _FLAT_MARKDOWN_FIELDS) and not _explicit(
+            "markdown_generator"
+        ):
+            crawler_config["markdown_generator"] = {
+                "type": "DefaultMarkdownGenerator",
+                "params": {
+                    "options": {
+                        k: present[k] for k in _FLAT_MARKDOWN_FIELDS if k in present
+                    }
+                },
+            }
+
+        for key in _FLAT_FIELD_TYPES:
+            data.pop(key, None)
+        data["crawler_config"] = crawler_config
+        return data
 
 
 class HookSpec(BaseModel):
