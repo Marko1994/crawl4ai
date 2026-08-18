@@ -2,9 +2,22 @@ version: '3.8'
 
 # Shared configuration for all environments
 x-base-config: &base-config
-  # No host port publish: crawl4ai is reached over the kb-crawl network by
-  # kb-worker (http://crawl4ai:11235), never from outside the host. Add back
-  # `ports: ["127.0.0.1:11235:11235"]` here temporarily for local curl/debug.
+  # Publish 11235, but bind it per host. The default is loopback, so the API is
+  # reachable by something on the same box - a TLS-terminating Caddy in front of
+  # a domain, or local curl - and by nothing on the network. Containers on the
+  # kb-crawl network reach it as http://crawl4ai:11235 regardless of this.
+  #
+  # A host that must serve the API to other machines sets CRAWL4AI_BIND=0.0.0.0
+  # in a gitignored `.env` beside this file (compose reads `.env` for
+  # interpolation; note that is NOT the same file as the env_file below, which
+  # only sets variables *inside* the container).
+  #
+  # Binding 0.0.0.0 exposes an admin-scoped API to the whole network: with
+  # security.api_token empty in config.yml the /token route is disabled, so no
+  # data-scope credential exists and every caller that authenticates holds
+  # admin. Prefer loopback plus a reverse proxy. See deploy/docker/DEPLOY.md.
+  ports:
+    - "${CRAWL4AI_BIND:-127.0.0.1}:11235:11235"
   env_file:
     - .llm.env       # API keys (create from .llm.env.example)
   # Uncomment to set default environment variables (will overwrite .llm.env)

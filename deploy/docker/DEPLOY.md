@@ -51,36 +51,42 @@ to the old value starts getting `401` the moment you deploy.
 
 ---
 
-## Host roles: internal vs LAN-facing
+## Where the API listens
 
-`docker-compose.yml` publishes **no host port**. That is correct for a host where
-crawl4ai only serves kb-worker over `kb-crawl` — the default, and what production
-uses.
-
-A host that must also be reachable by IP or hostname (e.g. a subdomain points at
-it) needs the port published, and that is a **per-host** setting: it must not go
-in `docker-compose.yml`, or it would silently expose the port on every host
-including production.
-
-Put it in `docker-compose.override.yml`, which compose auto-merges and which is
-gitignored precisely so it cannot follow the repo onto another host:
+`docker-compose.yml` publishes 11235, and only the **bind address** varies per
+host:
 
 ```yaml
-# docker-compose.override.yml - LAN-facing hosts only. Never on an internal host.
-services:
-  crawl4ai:
-    ports:
-      - "0.0.0.0:11235:11235"
+ports:
+  - "${CRAWL4AI_BIND:-127.0.0.1}:11235:11235"
 ```
 
-Because the file is gitignored, **recreating a LAN-facing host means recreating
-this file too.** Without it `docker compose up -d` succeeds, the container reports
-healthy, and nothing answers on the published port — a confusing failure, since
-the service itself is fine. If a subdomain stops resolving to a working API after
-a rebuild, check this first.
+The default is loopback. A fresh clone, and production, therefore expose the API
+to the host itself and to nothing on the network — which is what a
+TLS-terminating reverse proxy on the same box needs, and all it needs. Containers
+on `kb-crawl` reach the service as `http://crawl4ai:11235` regardless of this
+setting; the published port is only about access from outside Docker.
 
-Use `127.0.0.1:11235:11235` instead when you only need local access (curl, a dev
-UI on the same box); it keeps the API off the network entirely.
+A host that must serve other machines directly sets the override in a gitignored
+`.env` beside `docker-compose.yml`:
+
+```bash
+# .env - THIS host only. Never deployed.
+CRAWL4AI_BIND=0.0.0.0
+```
+
+> `.env` is **not** `.llm.env`. Compose reads `.env` when substituting `${...}`
+> in the compose file itself; `.llm.env` is the `env_file` and only sets
+> variables *inside* the container. They are unrelated, and a variable in the
+> wrong one silently does nothing.
+
+Because the default is safe, a host that never sets `CRAWL4AI_BIND` cannot end up
+accidentally exposed, and cannot end up with no published port either — the
+failure mode where compose succeeds, the container reports healthy, and nothing
+answers.
+
+To reach the API from the host for debugging, no configuration is needed: the
+default loopback bind already allows `curl http://localhost:11235/...`.
 
 ### What publishing costs you
 
@@ -164,10 +170,10 @@ is a security posture change, not just a version change.
   ```bash
   docker inspect <container> --format '{{json .HostConfig.PortBindings}}'
   ```
-- **Never publish 11235 on a production host.** The service is designed to sit
-  behind the internal network. If you must expose it temporarily to debug, bind
-  loopback only — `ports: ["127.0.0.1:11235:11235"]` — and remove it afterwards.
-  A bare `11235:11235` binds `0.0.0.0` and exposes an admin-scoped API to the LAN.
+- **Never set `CRAWL4AI_BIND=0.0.0.0` on a production host.** The default
+  loopback bind is already enough for a reverse proxy on the same box, and for
+  local `curl`. Binding all interfaces publishes an admin-scoped API to the
+  network with the bearer token as the only control.
 - **`POST /token` is disabled** when `config.yml` has an empty
   `security.api_token` (the token is supplied via the env var instead). No
   `data`-scope JWT can be issued, so **every caller that can authenticate holds
