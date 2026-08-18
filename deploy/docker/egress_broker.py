@@ -28,6 +28,7 @@ import ipaddress
 import logging
 import os
 import socket
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 from urllib.parse import urlparse
@@ -108,13 +109,52 @@ def is_forbidden_ip(ip_str: str) -> bool:
     return any(not form.is_global for form in _embedded_v4_forms(ip))
 
 
+# A dropped lookup is not a policy decision, but it reaches the caller as the
+# same opaque EgressBlocked -> HTTP 400 "URL blocked (SSRF protection)" that a
+# genuinely forbidden target does. 400 is terminal for clients (a 5xx would be
+# retried), so one momentary resolver hiccup permanently failed that URL and
+# blamed it on security policy.
+#
+# This is observed, not theoretical. The container resolves through Docker's
+# embedded DNS (127.0.0.11), which drops lookups when a batch crawl runs many
+# concurrently. Instrumentation caught it live: be-modaco.com and
+# bearwoodconcepts.com were both rejected with
+# "cause=dns_failure ... [Errno -5] No address associated with hostname", and
+# both resolved normally seconds later - one had crawled successfully minutes
+# before.
+#
+# The status cannot be split by cause without building a DNS oracle: separate
+# statuses for "did not resolve" and "resolved to a forbidden IP" would tell a
+# caller whether an internal hostname exists, which is what EgressBlocked's
+# opaque reason exists to prevent. So absorb the transience here instead. A
+# host that genuinely does not resolve still fails after the retries, and
+# terminal is the correct answer for it.
+#
+# Bounded and short: this sits in the request path, and the added delay is paid
+# only by hosts that fail to resolve at all.
+_RESOLVE_ATTEMPTS = 3
+_RESOLVE_BACKOFF_S = 0.05
+
+
 def _resolve(host: str, port: int):
-    try:
-        return socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as e:
-        # A dropped lookup and a policy rejection are indistinguishable to the
-        # caller by design; this line is the only way to tell them apart later.
-        raise _log_block("dns_failure", host, str(e))
+    for attempt in range(_RESOLVE_ATTEMPTS):
+        try:
+            answers = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+            if attempt:
+                # Log recoveries so the retry is measurable. Without this, a run
+                # with no dns_failure lines is indistinguishable from a run where
+                # DNS never faltered, and there is no way to show this works.
+                logger.info(
+                    "dns_retry recovered: host=%s attempt=%d", host, attempt + 1
+                )
+            return answers
+        except socket.gaierror as e:
+            if attempt == _RESOLVE_ATTEMPTS - 1:
+                # Only a give-up counts as dns_failure, so that counter keeps
+                # meaning "a lookup was abandoned".
+                raise _log_block("dns_failure", host, str(e))
+            time.sleep(_RESOLVE_BACKOFF_S * (2 ** attempt))
+    raise _log_block("dns_failure", host)  # unreachable; keeps the exit explicit
 
 
 def assert_host_allowed(host: str, port: int = 0) -> None:
