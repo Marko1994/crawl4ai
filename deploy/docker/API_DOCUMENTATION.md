@@ -130,8 +130,8 @@ LLM-extracted JSON.
 | Field | Type | Default | What it does |
 | :--- | :---: | :---: | :--- |
 | `urls` | `array` | **required** | 1–100 URLs to crawl. |
-| `max_pages` | `integer` | *none* | Page budget for a deep crawl. **Admin scope.** |
-| `max_depth` | `integer` | *none* | Link depth to follow. `1` = homepage + direct links. **Admin scope.** |
+| `max_pages` | `integer` | *none* | Page budget for a deep crawl. Must be >= 1. **Admin scope.** |
+| `max_depth` | `integer` | *none* | Link depth to follow. `0` = **this page only, follow no links**; `1` = page + its direct links. Must be >= 0. **Admin scope.** |
 | `include_external` | `boolean` | `false` | Follow links off-domain. Only meaningful alongside `max_pages`/`max_depth`. **Admin scope.** |
 | `ignore_links` | `boolean` | `false` | `true` strips `[text](url)` from Markdown. |
 | `ignore_images` | `boolean` | `false` | `true` strips `![alt](url)` from Markdown. |
@@ -144,8 +144,10 @@ LLM-extracted JSON.
 implicit default — omit both and you get a single-page crawl. Sending
 `include_external` alone does *not* trigger a deep crawl.
 
-The server clamps deep crawls regardless of what you ask for: `config.yml`
-`limits.max_pages: 100` and `limits.max_depth: 5`.
+The server clamps deep crawls regardless of what you ask for, to 100 pages and
+depth 5. Those ceilings are module constants in `governor.py`, **not** the
+`limits.max_pages` / `limits.max_depth` keys in `config.yml`, which are read
+nowhere — see §8.
 
 <details>
 <summary>Equivalent nested form (also supported)</summary>
@@ -411,7 +413,7 @@ async function fetchAllDeviceHtml(url) {
 | Status | Meaning | Fix |
 | :--- | :---: | :--- |
 | `401` | Missing/invalid token, or not sent as `Authorization: Bearer …` | Check the token matches `CRAWL4AI_API_TOKEN`. There is no `X-API-Key` support. |
-| `422` | Malformed body — wrong type on a field, empty `urls` | Check types: `max_pages`/`max_depth` integers, `schema` an object. |
+| `422` | Malformed body — wrong **type** or out of **range** | `max_pages`/`max_depth` must be integers, `schema` an object. Range: `max_pages` >= 1, `max_depth` >= 0. |
 | `400` `Rejected config` | Deep crawl or LLM extraction attempted **without admin scope** | Send the static `CRAWL4AI_API_TOKEN`, not a `/token` JWT. |
 | `400` `LLM provider not allowed` | `provider` outside `allowed_providers` | Use `gemini/gemini-flash-latest`. |
 | `413` | Body over 10 MiB | Reduce `urls`. |

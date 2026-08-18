@@ -441,7 +441,7 @@ def test_out_of_range_deep_crawl_bounds_are_rejected(field, value):
     The floors differ: a crawl must fetch at least one page, but depth 0 is a
     real request (see below), so only depth < 0 is out of range.
     """
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="at least"):
         CrawlRequest(urls=["https://example.com"], **{field: value})
 
 
@@ -476,6 +476,48 @@ def test_the_single_page_request_shape_survives_the_safe_builder():
 
     assert strategy.max_depth == 0
     assert strategy.max_pages == 1
+    assert strategy.include_external is False
+    assert req.crawler_config["markdown_generator"]["params"]["options"] == {
+        "ignore_images": True
+    }
+
+
+def test_the_governor_preserves_an_explicit_max_depth_of_zero():
+    """Depth 0 must survive the clamp, not just validation.
+
+    clamp_deep_crawl currently tests `md is None or md > max_depth`. Rewriting
+    that to a truthiness check - `if not md` - reads like a tidy-up and passes
+    every other test in this file, but would silently promote every single-page
+    crawl to a depth-5, 100-page site crawl. This pins the 0 end to end; the
+    neighbouring test pins the upper bound.
+    """
+    from api import _build_safe_deep_crawl_strategy
+    from governor import clamp_deep_crawl
+    from crawl4ai.async_configs import CrawlerRunConfig
+
+    req = CrawlRequest(urls=["https://example.com"], max_pages=1, max_depth=0)
+    cfg = CrawlerRunConfig()
+    cfg.deep_crawl_strategy = _build_safe_deep_crawl_strategy(
+        req.crawler_config["deep_crawl_strategy"]
+    )
+    clamp_deep_crawl(cfg)
+
+    assert cfg.deep_crawl_strategy.max_depth == 0, "clamp rewrote a legitimate 0"
+    assert cfg.deep_crawl_strategy.max_pages == 1
+
+
+def test_every_integer_flat_field_declares_a_lower_bound():
+    """A new int field without a minimum would silently get no floor.
+
+    The bound lookup is `_FLAT_FIELD_MINIMUMS.get(key)`, so an omission is not
+    an error - it just disables range checking for that field, which is exactly
+    what the minimums exist to prevent.
+    """
+    from schemas import _FLAT_FIELD_MINIMUMS, _FLAT_FIELD_TYPES
+
+    integer_fields = {k for k, v in _FLAT_FIELD_TYPES.items() if v is int}
+
+    assert integer_fields == set(_FLAT_FIELD_MINIMUMS)
 
 
 def test_an_oversized_flat_budget_is_clamped_by_the_governor():
