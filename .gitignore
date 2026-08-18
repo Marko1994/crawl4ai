@@ -311,3 +311,6 @@ out/
 
 # entrypoint.sh is a required deployment artifact (Dockerfile COPYs it)
 !deploy/docker/entrypoint.sh
+
+# Local compose overrides (per-machine dev settings; never deployed)
+docker-compose.override.yml

@@ -435,10 +435,47 @@ def test_non_dict_crawler_config_with_a_flat_field_is_a_422_not_a_500(
 
 
 @pytest.mark.parametrize("field,value", [("max_pages", 0), ("max_depth", -1)])
-def test_non_positive_deep_crawl_bounds_are_rejected(field, value):
-    """governor.clamp_deep_crawl only clamps *upward*, so negatives would survive."""
+def test_out_of_range_deep_crawl_bounds_are_rejected(field, value):
+    """governor.clamp_deep_crawl only clamps *upward*, so these would survive.
+
+    The floors differ: a crawl must fetch at least one page, but depth 0 is a
+    real request (see below), so only depth < 0 is out of range.
+    """
     with pytest.raises(ValueError):
         CrawlRequest(urls=["https://example.com"], **{field: value})
+
+
+def test_max_depth_zero_means_this_page_only():
+    """Depth 0 is a legitimate single-page crawl, not an invalid value.
+
+    BFSDeepCrawlStrategy gates link-following on `next_depth > max_depth`
+    (bfs_strategy.py), so depth 0 fetches the start URL and follows nothing.
+    Rejecting it broke real callers asking for exactly one page.
+    """
+    req = CrawlRequest(urls=["https://example.com"], max_pages=1, max_depth=0)
+
+    assert req.crawler_config["deep_crawl_strategy"] == {
+        "name": "BFSDeepCrawlStrategy",
+        "max_pages": 1,
+        "max_depth": 0,
+    }
+
+
+def test_the_single_page_request_shape_survives_the_safe_builder():
+    """The exact body a caller sends for 'just this one page'."""
+    from api import _build_safe_deep_crawl_strategy
+
+    req = CrawlRequest(
+        urls=["https://example.com"],
+        max_pages=1,
+        max_depth=0,
+        include_external=False,
+        ignore_images=True,
+    )
+    strategy = _build_safe_deep_crawl_strategy(req.crawler_config["deep_crawl_strategy"])
+
+    assert strategy.max_depth == 0
+    assert strategy.max_pages == 1
 
 
 def test_an_oversized_flat_budget_is_clamped_by_the_governor():

@@ -37,6 +37,16 @@ _FLAT_FIELD_TYPES = {
     "schema": dict,
 }
 
+# Lower bounds, checked here because governor.clamp_deep_crawl only clamps
+# *upward* - an out-of-range low value would otherwise reach the strategy.
+# The floors differ: a crawl must fetch at least one page, but depth 0 is a
+# real request meaning "this page only, follow no links" (BFSDeepCrawlStrategy
+# gates link-following on `next_depth > max_depth`), so 0 must be accepted.
+_FLAT_FIELD_MINIMUMS = {
+    "max_pages": 1,
+    "max_depth": 0,
+}
+
 
 class CrawlRequest(BaseModel):
     urls: List[str] = Field(min_length=1, max_length=100)
@@ -78,10 +88,9 @@ class CrawlRequest(BaseModel):
             if expected is int:
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise ValueError(f"{key} must be an integer")
-                # governor.clamp_deep_crawl only clamps *upward*, so a negative
-                # or zero budget would otherwise reach the strategy unchecked.
-                if value < 1:
-                    raise ValueError(f"{key} must be at least 1")
+                minimum = _FLAT_FIELD_MINIMUMS.get(key)
+                if minimum is not None and value < minimum:
+                    raise ValueError(f"{key} must be at least {minimum}")
             elif not isinstance(value, expected):
                 article = "an object" if expected is dict else f"a {expected.__name__}"
                 raise ValueError(f"{key} must be {article}")
