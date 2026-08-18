@@ -942,6 +942,27 @@ async def metrics():
     return RedirectResponse(config["observability"]["prometheus"]["endpoint"])
 
 
+# A crawl error is worth returning - it is how a caller distinguishes a dead
+# target from a broken server - but error_message is not safe to echo whole. A
+# Playwright failure embeds the interpreter path and the surrounding source
+# lines, which is exactly the internal detail 500 is genericised to withhold.
+# Keep the cause, drop the internals, and bound the length.
+_MAX_FAILURE_REASON_CHARS = 300
+
+
+def _crawl_failure_reason(error_message: Optional[str]) -> str:
+    """Condense a crawl error_message into a caller-safe reason."""
+    text = str(error_message or "").strip()
+    if not text:
+        return "no error reported"
+    # Playwright appends the failing source lines after this marker.
+    text = text.split("Code context:")[0]
+    # Strip bracketed file paths, e.g. "(../usr/local/.../async_crawler_strategy.py):".
+    text = re.sub(r"\(\.{0,2}[^()\s]*\.py\)?:?", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:_MAX_FAILURE_REASON_CHARS] or "no error reported"
+
+
 @app.post("/crawl")
 @limiter.limit(config["rate_limiting"]["default_limit"])
 @mcp_tool("crawl")
@@ -1020,7 +1041,17 @@ async def crawl(
     )
     # check if all of the results are not successful
     if all(not result["success"] for result in results["results"]):
-        raise HTTPException(500, f"Crawl request failed: {results['results'][0]['error_message']}")
+        # 502, not 500: every target failed, which is an upstream outcome, not a
+        # fault in this server. _http_exception_handler genericises 500 (the
+        # raw-str(e) leak vector) into an opaque correlation id, so raising 500
+        # here threw the reason away and left callers unable to tell "the site
+        # is dead" from "crawl4ai broke". 502 is one of the deliberate
+        # operational statuses that handler passes through with its detail, and
+        # it stays >= 500 so clients that retry 5xx behave exactly as before.
+        raise HTTPException(
+            502,
+            f"Crawl request failed: {_crawl_failure_reason(results['results'][0].get('error_message'))}",
+        )
     return JSONResponse(results)
 
 
