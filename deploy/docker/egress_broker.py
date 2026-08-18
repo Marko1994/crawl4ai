@@ -25,6 +25,7 @@ leaks a resolved internal IP, hostname, or traceback (the old DNS oracle).
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import socket
 from dataclasses import dataclass
@@ -37,6 +38,8 @@ ALLOW_INTERNAL = os.environ.get("CRAWL4AI_ALLOW_INTERNAL_URLS", "false").lower()
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _V4COMPAT = ipaddress.ip_network("::/96")
 _6TO4 = ipaddress.ip_network("2002::/16")
+
+logger = logging.getLogger(__name__)
 
 # Hostnames we refuse regardless of resolution (belt-and-suspenders; they also
 # resolve to non-global addresses and would be caught anyway).
@@ -52,6 +55,22 @@ class EgressBlocked(Exception):
     def __init__(self, reason: str = "URL blocked"):
         self.reason = reason
         super().__init__(reason)
+
+
+# The opaque `reason` above is what the CALLER sees, and it must stay opaque:
+# distinguishing "did not resolve" from "resolved to a forbidden IP" would let a
+# caller probe for internal hostnames. The server log has no such constraint,
+# and without it a block is undiagnosable - a healthy public domain rejected
+# once in a few hundred lookups is indistinguishable from a policy decision,
+# which cost a long investigation with no way to tell the two apart.
+#
+# Record the deciding branch here only. Never surface `cause` to a caller.
+def _log_block(cause: str, host: str = "", detail: str = "") -> "EgressBlocked":
+    logger.info(
+        "egress blocked: cause=%s host=%s%s",
+        cause, host or "?", f" detail={detail}" if detail else "",
+    )
+    return EgressBlocked()
 
 
 @dataclass
@@ -92,8 +111,10 @@ def is_forbidden_ip(ip_str: str) -> bool:
 def _resolve(host: str, port: int):
     try:
         return socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except socket.gaierror:
-        raise EgressBlocked()
+    except socket.gaierror as e:
+        # A dropped lookup and a policy rejection are indistinguishable to the
+        # caller by design; this line is the only way to tell them apart later.
+        raise _log_block("dns_failure", host, str(e))
 
 
 def assert_host_allowed(host: str, port: int = 0) -> None:
@@ -132,18 +153,18 @@ def resolve_and_pin(url: str) -> PinnedTarget:
 
     low = host.lower()
     if low in _BLOCKED_HOSTNAMES or low.startswith("host.docker.internal"):
-        raise EgressBlocked()
+        raise _log_block("blocked_hostname", host)
 
     answers = _resolve(host, port)
     pinned = None
     for *_, sockaddr in answers:
         if is_forbidden_ip(sockaddr[0]):
             # Reject the host outright if ANY of its records is internal.
-            raise EgressBlocked()
+            raise _log_block("forbidden_ip", host, sockaddr[0])
         if pinned is None:
             pinned = sockaddr[0]
     if pinned is None:
-        raise EgressBlocked()
+        raise _log_block("empty_answers", host)
     return PinnedTarget(scheme, host, port, pinned)
 
 
