@@ -87,5 +87,20 @@ services:
 
 networks:
   default: {}
+  # PREREQUISITE: `external: true` means compose will NOT create this network.
+  # If it does not already exist on the host, every `docker compose up` fails
+  # immediately with:
+  #
+  #     network kb-crawl declared as external, but could not be found
+  #
+  # It is owned by the kb-worker stack, so on a host where that stack has never
+  # run (a fresh VPS, a rebuilt box) you must create it before the first deploy:
+  #
+  #     docker network ls | grep kb-crawl        # check
+  #     docker network create kb-crawl           # create if missing
+  #
+  # Do not "fix" this by dropping the network or switching it to non-external:
+  # crawl4ai publishes no host port, so kb-crawl is the only path kb-worker has
+  # to reach it. See deploy/docker/DEPLOY.md.
   kb-crawl:
     external: true
