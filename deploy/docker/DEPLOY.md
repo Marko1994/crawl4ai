@@ -51,6 +51,50 @@ to the old value starts getting `401` the moment you deploy.
 
 ---
 
+## Host roles: internal vs LAN-facing
+
+`docker-compose.yml` publishes **no host port**. That is correct for a host where
+crawl4ai only serves kb-worker over `kb-crawl` — the default, and what production
+uses.
+
+A host that must also be reachable by IP or hostname (e.g. a subdomain points at
+it) needs the port published, and that is a **per-host** setting: it must not go
+in `docker-compose.yml`, or it would silently expose the port on every host
+including production.
+
+Put it in `docker-compose.override.yml`, which compose auto-merges and which is
+gitignored precisely so it cannot follow the repo onto another host:
+
+```yaml
+# docker-compose.override.yml - LAN-facing hosts only. Never on an internal host.
+services:
+  crawl4ai:
+    ports:
+      - "0.0.0.0:11235:11235"
+```
+
+Because the file is gitignored, **recreating a LAN-facing host means recreating
+this file too.** Without it `docker compose up -d` succeeds, the container reports
+healthy, and nothing answers on the published port — a confusing failure, since
+the service itself is fine. If a subdomain stops resolving to a working API after
+a rebuild, check this first.
+
+Use `127.0.0.1:11235:11235` instead when you only need local access (curl, a dev
+UI on the same box); it keeps the API off the network entirely.
+
+### What publishing costs you
+
+The bearer token becomes the only thing in front of the API. With
+`security.api_token` empty in `config.yml` (the token is supplied by env instead)
+`POST /token` is disabled, so no `data`-scope JWT can be issued and **every caller
+that can authenticate holds `admin`** — deep crawl and LLM extraction included.
+
+If the port is reachable, treat `CRAWL4AI_API_TOKEN` as a production secret:
+rotate it if it has ever been committed, and prefer terminating TLS at a reverse
+proxy rather than serving `:11235` directly, so the token is not sent in the clear.
+
+---
+
 ## Deploy
 
 ```bash
