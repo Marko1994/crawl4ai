@@ -27,6 +27,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 from urllib.parse import urlparse
@@ -89,11 +90,36 @@ def is_forbidden_ip(ip_str: str) -> bool:
     return any(not form.is_global for form in _embedded_v4_forms(ip))
 
 
+# A dropped lookup is not a policy decision, but it lands on the caller as the
+# same opaque EgressBlocked -> HTTP 400 that a genuinely forbidden target does.
+# 400 is terminal for clients (a 5xx would be retried), so a momentary
+# resolver hiccup permanently fails that URL and reports it as a security
+# block. Under concurrency this is common: the container resolves through
+# Docker's embedded DNS (127.0.0.11), which drops lookups when a batch crawl
+# runs many at once - legitimate public hosts then appear "blocked".
+#
+# The status cannot be split by cause without building a DNS oracle: separate
+# statuses for "did not resolve" and "resolved to a forbidden IP" would tell a
+# caller whether an internal hostname exists, which is exactly what
+# EgressBlocked's opaque reason exists to prevent. So absorb the transience
+# here instead. A host that genuinely does not resolve still fails after the
+# retries, and terminal is the correct answer for it.
+#
+# Deliberately bounded and short: this sits in the request path, and the added
+# latency is paid only by hosts that fail to resolve at all.
+_RESOLVE_ATTEMPTS = 3
+_RESOLVE_BACKOFF_S = 0.05
+
+
 def _resolve(host: str, port: int):
-    try:
-        return socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except socket.gaierror:
-        raise EgressBlocked()
+    for attempt in range(_RESOLVE_ATTEMPTS):
+        try:
+            return socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            if attempt == _RESOLVE_ATTEMPTS - 1:
+                raise EgressBlocked()
+            time.sleep(_RESOLVE_BACKOFF_S * (2 ** attempt))
+    raise EgressBlocked()  # unreachable; keeps the failure mode explicit
 
 
 def assert_host_allowed(host: str, port: int = 0) -> None:
