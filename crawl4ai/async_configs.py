@@ -418,14 +418,26 @@ def from_serializable_dict(data: Any, provenance: "Provenance" = None) -> Any:
     # Handle typed data.
     # Only enter the typed-object path for dicts that match the shapes produced
     # by to_serializable_dict(): {"type": "<ClassName>", "params": {...}} or
-    # {"type": "dict", "value": {...}}.  Plain business dicts that happen to
-    # carry a "type" key (e.g. JSON-Schema fragments, JsonCss field specs like
-    # {"type": "text", "name": "..."}) have neither "params" nor "value" and
-    # must fall through to the raw-dict path below so they are passed as data.
+    # {"type": "dict", "value": {...}}. A dict with ONLY a "type" key whose
+    # value is a known crawl4ai class name (e.g. {"type": "PruningContentFilter"},
+    # hand-written by an API caller who omitted an empty "params") is also
+    # accepted as shorthand for "construct with defaults", since
+    # to_serializable_dict() always emits "params" (possibly {}) for real
+    # objects. A dict with a class-name "type" PLUS some other key (e.g.
+    # {"type": "DefaultMarkdownGenerator", "options": {...}}) is a likely typo
+    # for "params" and must still fall through so callers get a clear error
+    # instead of silently ignoring the extra key. Plain business dicts that
+    # happen to carry a "type" key (e.g. JSON-Schema fragments, JsonCss field
+    # specs like {"type": "text", "name": "..."}) use non-class-name type
+    # values and also fall through to the raw-dict path below.
     if (
         isinstance(data, dict)
         and "type" in data
-        and ("params" in data or (data["type"] == "dict" and "value" in data))
+        and (
+            "params" in data
+            or (data["type"] == "dict" and "value" in data)
+            or (data["type"] in ALLOWED_DESERIALIZE_TYPES and data.keys() == {"type"})
+        )
     ):
         # Handle plain dictionaries
         if data["type"] == "dict" and "value" in data:
@@ -457,12 +469,14 @@ def from_serializable_dict(data: Any, provenance: "Provenance" = None) -> Any:
                 continue
 
         if cls is not None:
-            # Handle Enum
+            # Handle Enum. Enums have no meaningful "construct with defaults"
+            # shorthand (the value IS the params), so a missing "params" falls
+            # through to the raw-dict path below instead of erroring here.
             if issubclass(cls, Enum):
-                return cls(data["params"])
-
-            if "params" in data:
-                params = data["params"]
+                if "params" in data:
+                    return cls(data["params"])
+            else:
+                params = data.get("params", {})
                 if provenance == Provenance.UNTRUSTED:
                     params = _enforce_untrusted(type_name, dict(params))
                 # Handle class instances
